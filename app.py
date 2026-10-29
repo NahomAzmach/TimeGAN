@@ -4,7 +4,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import os
 
-from timegan_core import tgan
+import timegan_core
+import timegan_torch
 import data_processor
 import metrics
 
@@ -34,7 +35,12 @@ scenario = st.sidebar.selectbox("Scenario Description", ["Baseline", "Load Surge
 
 iterations = st.sidebar.slider("Training Iterations", 100, 5000, 500, step=100, help="Number of training iterations for TimeGAN.")
 n_samples = st.sidebar.slider("Number of Sample Sequences", 20, 1000, 100, step=20, help="Number of Real sequences to fetch and Synthetic sequences to generate. A single building-year has ~365 days, so real data is capped at half of that per scenario; pooled groups allow the full range.")
-seed = st.sidebar.number_input("Random Seed", value=42, step=1, help="Fixes numpy/TensorFlow randomness so runs are reproducible.")
+seed = st.sidebar.number_input("Random Seed", value=42, step=1, help="Fixes numpy/TensorFlow/PyTorch randomness so runs are reproducible.")
+backend = st.sidebar.radio("Backend", ["PyTorch", "TensorFlow (original)"],
+                           help="PyTorch is the maintained port and records per-phase loss curves. The TensorFlow version is the original TF1-compat implementation, kept for comparison.")
+shifted_loss = st.sidebar.checkbox("Paper's next-step supervised loss", value=True, disabled=backend != "PyTorch",
+                                   help="The paper trains the supervisor to predict the *next* latent step. The original TF code compared the same step, "
+                                        "so the supervisor only learned to copy its input. Untick to reproduce the original behavior in PyTorch.")
 
 if 'synthetic_data' not in st.session_state:
     st.session_state.synthetic_data = None
@@ -77,15 +83,21 @@ if st.sidebar.button("Train Vector & Generate Data"):
         'iterations': iterations,
         'batch_size': min(32, len(real_data)),
         'z_dim': 1,
-        'seed': int(seed)
+        'seed': int(seed),
+        'shifted_supervised_loss': shifted_loss
     }
 
     try:
         with st.spinner("Training GAN..."):
-            synthetic_data = tgan(real_data, parameters, progress_callback=on_tgan_progress)
+            if backend == "PyTorch":
+                synthetic_data, loss_history = timegan_torch.tgan(real_data, parameters, progress_callback=on_tgan_progress, return_history=True)
+            else:
+                synthetic_data, loss_history = timegan_core.tgan(real_data, parameters, progress_callback=on_tgan_progress), None
         st.session_state.synthetic_data = synthetic_data
+        st.session_state.loss_history = loss_history
         # Remember what this model was trained on, independent of later sidebar changes
-        st.session_state.trained_on = {'scenario': scenario, 'building': building, 'source': source, 'iterations': iterations}
+        st.session_state.trained_on = {'scenario': scenario, 'building': building, 'source': source, 'iterations': iterations,
+                                       'backend': backend if backend != "PyTorch" else f"PyTorch ({timegan_torch.device_name()})"}
         tgan_progress.progress(100, text="Training Complete!")
         st.success("Successfully Synthesized Data preserving original physical correlations.")
     except Exception as e:
@@ -101,7 +113,7 @@ if st.session_state.synthetic_data is not None and st.session_state.real_data is
     if trained_on['source'] == "mock fallback":
         st.warning("Real data couldn't be downloaded, so the 'Real' sequences below come from the mathematical fallback generator.")
     else:
-        st.caption(f"Real data: {len(real)} days from **{data_processor.describe_option(trained_on['source'], buildings)}** (BDG-2 Panther, 2017). Model trained for {trained_on['iterations']} iterations per phase.")
+        st.caption(f"Real data: {len(real)} days from **{data_processor.describe_option(trained_on['source'], buildings)}** (BDG-2 Panther, 2017). Model trained for {trained_on['iterations']} iterations per phase with {trained_on['backend']}.")
 
     fig, axes = plt.subplots(1, 2, figsize=(15, 5), sharey=True)
 
@@ -119,6 +131,37 @@ if st.session_state.synthetic_data is not None and st.session_state.real_data is
         axes[1].plot(s_seq, color='red', alpha=0.3)
 
     st.pyplot(fig)
+
+    loss_history = st.session_state.get('loss_history')
+    if loss_history:
+        with st.expander("Training Loss Curves", expanded=True):
+            fig_loss, axes_loss = plt.subplots(1, 3, figsize=(15, 4))
+
+            def smooth(values, window=25):
+                values = np.asarray(values)
+                if len(values) < window:
+                    return values
+                return np.convolve(values, np.ones(window) / window, mode='valid')
+
+            axes_loss[0].plot(smooth(loss_history['embedding_recon']))
+            axes_loss[0].set_title("1. Embedding: reconstruction MSE")
+            axes_loss[1].plot(smooth(loss_history['supervised']))
+            axes_loss[1].set_title("2. Supervisor: supervised MSE")
+            for ax in axes_loss[:2]:
+                ax.set_yscale('log')
+                ax.set_xlabel("Iteration")
+
+            for key, label in [('joint_D', "Discriminator"), ('joint_G_adversarial', "Generator (adversarial)"),
+                               ('joint_G_moments', "Generator (moments)")]:
+                axes_loss[2].plot(smooth(loss_history[key]), label=label)
+            # D loss is a sum of 3 BCE terms; 3·ln2 is what it would be if D couldn't tell real from fake at all
+            axes_loss[2].axhline(3 * np.log(2), color='gray', linestyle=':', label="D at chance (3·ln2)")
+            axes_loss[2].set_title("3. Joint training")
+            axes_loss[2].set_xlabel("Iteration")
+            axes_loss[2].legend(fontsize=8)
+            st.pyplot(fig_loss)
+            st.caption("Curves are smoothed over 25 iterations. Phases 1–2 should drop and flatten before joint training starts. "
+                       "In phase 3, a discriminator loss far below the dotted line means it's winning and the generator isn't keeping up.")
 
     st.markdown("---")
     st.subheader("Quantitative Evaluation")
