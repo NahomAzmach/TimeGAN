@@ -1,60 +1,57 @@
 import os
-import tarfile
+import urllib.request
 import pandas as pd
 import numpy as np
-import boto3
-from botocore import UNSIGNED
-from botocore.config import Config
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "BuildingsBench_Data")
-TAR_FILE = os.path.join(DATA_DIR, "BuildingsBench.tar.gz")
 
-def download_and_extract_buildings_bench(progress_callback=None):
-    if not os.path.exists(DATA_DIR):
-        os.makedirs(DATA_DIR)
-        
-    extracted_path = os.path.join(DATA_DIR, "BuildingsBench")
-    
-    # Download
-    s3 = boto3.client('s3', region_name='us-west-2', config=Config(signature_version=UNSIGNED))
-    bucket = 'oedi-data-lake'
-    
-    files_to_download = [
-        ('buildings-bench/v2.0.0/compressed/BuildingsBench.tar.gz', os.path.join(DATA_DIR, 'BuildingsBench.tar.gz')),
-        ('buildings-bench/v2.0.0/compressed/metadata.tar.gz', os.path.join(DATA_DIR, 'metadata.tar.gz'))
-    ]
-    
-    for key, local_file in files_to_download:
-        if not os.path.exists(local_file) and not os.path.exists(os.path.join(extracted_path, "metadata", "benchmark.toml")):
-            if progress_callback: progress_callback(f"Downloading {os.path.basename(local_file)}...", 0)
-            # Get file size
-            response = s3.head_object(Bucket=bucket, Key=key)
-            total_size = int(response.get('ContentLength', 0))
-            
-            # Stream download
+# BDG-2 site CSVs are served individually from the public OEDI bucket,
+# so there's no need to pull the full multi-GB BuildingsBench tarball.
+S3_BASE = "https://oedi-data-lake.s3.us-west-2.amazonaws.com/buildings-bench/v2.0.0/BuildingsBench/BDG-2"
+DEFAULT_SITE = "Panther"
+DEFAULT_YEAR = 2017
+DEFAULT_BUILDING = "Panther_office_Hannah"
+
+def download_site_csv(site=DEFAULT_SITE, year=DEFAULT_YEAR, progress_callback=None):
+    """
+    Downloads one BDG-2 site CSV (~8 MB, one column per building, hourly) and caches it locally.
+    Returns the local file path.
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+    filename = f"{site}_clean={year}.csv"
+    local_file = os.path.join(DATA_DIR, filename)
+
+    if not os.path.exists(local_file):
+        if progress_callback: progress_callback(f"Downloading {filename}...", 0)
+        tmp_file = local_file + ".part"
+        with urllib.request.urlopen(f"{S3_BASE}/{filename}", timeout=60) as resp, open(tmp_file, 'wb') as f:
+            total_size = int(resp.headers.get('Content-Length', 0))
             downloaded = 0
-            with open(local_file, 'wb') as f:
-                resp = s3.get_object(Bucket=bucket, Key=key)
-                for chunk in resp['Body'].iter_chunks(chunk_size=1024*1024*10):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if progress_callback and total_size > 0:
-                            progress_callback(f"Downloading {os.path.basename(local_file)} ({downloaded // (1024*1024)} MB / {total_size // (1024*1024)} MB)", int((downloaded/total_size)*50))
-        
-        # Extract
-        if os.path.exists(local_file) and not os.path.exists(os.path.join(extracted_path, "metadata", "benchmark.toml")):
-            if progress_callback: progress_callback(f"Extracting {os.path.basename(local_file)}...", 50)
-            with tarfile.open(local_file, 'r:gz') as tar:
-                tar.extractall(path=DATA_DIR)
-            
-    os.environ["BUILDINGS_BENCH"] = extracted_path
-    if progress_callback: progress_callback("BuildingsBench Data Ready", 100)
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                if progress_callback and total_size > 0:
+                    progress_callback(f"Downloading {filename} ({downloaded // (1024*1024)} MB / {total_size // (1024*1024)} MB)", int((downloaded / total_size) * 50))
+        os.replace(tmp_file, local_file)
+
+    return local_file
+
+def load_site_dataframe(site=DEFAULT_SITE, year=DEFAULT_YEAR, progress_callback=None):
+    local_file = download_site_csv(site, year, progress_callback)
+    return pd.read_csv(local_file, index_col=0, parse_dates=True)
+
+def list_buildings(site=DEFAULT_SITE, year=DEFAULT_YEAR):
+    """Returns the building column names for a site (reads only the CSV header)."""
+    local_file = download_site_csv(site, year)
+    return list(pd.read_csv(local_file, index_col=0, nrows=0).columns)
 
 def generate_mock_energy_data(scenario, seq_len, n_samples):
     """
     Fallback mathematical generation replicating real energy trends
-    for scenarios if device storage is exhausted.
+    for scenarios if the real data can't be fetched (e.g. offline).
     """
     dataX = []
     for _ in range(n_samples):
@@ -63,38 +60,33 @@ def generate_mock_energy_data(scenario, seq_len, n_samples):
         base_load = np.sin(hours - np.pi / 2) * 5 + 15  # Scaled to 10 - 20 kWh
         noise = np.random.normal(0, 0.8, seq_len)
         seq = base_load + noise
-        
+
         if scenario == "Load Surge":
             # Induce a sharp random spike imitating heavy HVAC/Equipment usage
             surge_hour = np.random.randint(14, 18)
             seq[surge_hour] += np.random.uniform(15, 25)
             # Add secondary smaller spike
             seq[surge_hour-1] += np.random.uniform(5, 10)
-            
+
         dataX.append(seq.reshape(-1, 1))
     return dataX
 
-def load_scenario_data(scenario="Baseline", seq_len=24, n_samples=100, progress_callback=None):
+def load_scenario_data(scenario="Baseline", seq_len=24, n_samples=100, building=DEFAULT_BUILDING, progress_callback=None):
     """
-    Downloads, extracts and filters BuildingsBench evaluation data based on Scenario.
+    Loads one BDG-2 building's hourly load and filters daily sequences by Scenario.
     scenario: 'Baseline' or 'Load Surge'
-    Returns dataX: List of numpy arrays, each of shape [seq_len, 1]
+    Returns (dataX, source): dataX is a list of numpy arrays, each of shape [seq_len, 1];
+    source describes where the data came from ('real' building name or 'mock fallback').
     """
     try:
-        download_and_extract_buildings_bench(progress_callback)
-        
-        from buildings_bench import load_pandas_dataset
-        
-        if progress_callback: progress_callback("Loading Pandas Dataset...", 50)
-        # bdg-2:panther is one of the evaluation subsets
-        generator = load_pandas_dataset('bdg-2:panther')
-        
-        # Generator yields building_name, dataframe
-        building_name, df = next(generator)
-        
-        # df has a datetime index and 'load' column
-        loads = df['load'].values
-        
+        if progress_callback: progress_callback("Loading BDG-2 site data...", 0)
+        df = load_site_dataframe(progress_callback=progress_callback)
+        if building not in df.columns:
+            raise KeyError(f"Building '{building}' not found in site data")
+
+        if progress_callback: progress_callback(f"Slicing {building} into daily sequences...", 60)
+        loads = df[building].values
+
         # Chop into sequences of length seq_len
         num_seq = len(loads) // seq_len
         sequences = []
@@ -102,14 +94,17 @@ def load_scenario_data(scenario="Baseline", seq_len=24, n_samples=100, progress_
             seq = loads[i*seq_len : (i+1)*seq_len]
             if not np.any(np.isnan(seq)):
                 sequences.append(seq)
-                
+
         # Calculate variation metrics to separate scenarios
         # Variation = Max - Min
         variations = [np.max(s) - np.min(s) for s in sequences]
-        
+
         # We sort sequences by their load variation
         sorted_pairs = sorted(zip(variations, sequences), key=lambda x: x[0])
-        
+
+        # A single building-year only has ~365 days, so cap at half to keep the scenarios disjoint
+        n_samples = min(n_samples, len(sorted_pairs) // 2)
+
         if scenario == "Baseline":
             # Baseline: normal cyclical, low variation
             selected_seqs = [seq for var, seq in sorted_pairs[:n_samples]]
@@ -118,18 +113,16 @@ def load_scenario_data(scenario="Baseline", seq_len=24, n_samples=100, progress_
             selected_seqs = [seq for var, seq in sorted_pairs[-n_samples:]]
         else:
             selected_seqs = [seq for var, seq in sorted_pairs[n_samples:n_samples*2]]
-            
+
         # Convert to TimeGAN expected shape
         dataX = []
         for seq in selected_seqs:
             dataX.append(seq.reshape(-1, 1))
-            
+
         if progress_callback: progress_callback(f"Successfully loaded {len(dataX)} real {scenario} sequences.", 100)
-        return dataX
-        
+        return dataX, building
+
     except Exception as e:
-        if progress_callback: progress_callback(f"Storage Error, generating mathematical '{scenario}' fallback...", 100)
-        print(f"Extraction failed ({e}), using math fallback generator.")
-        return generate_mock_energy_data(scenario, seq_len, n_samples)
-
-
+        if progress_callback: progress_callback(f"Real data unavailable, generating mathematical '{scenario}' fallback...", 100)
+        print(f"Real data load failed ({e}), using math fallback generator.")
+        return generate_mock_energy_data(scenario, seq_len, n_samples), "mock fallback"

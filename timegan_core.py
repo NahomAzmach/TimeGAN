@@ -21,6 +21,9 @@ def tgan(dataX, parameters, progress_callback=None):
     progress_callback: A function(progress_ratio) to update the Streamlit UI
     """
     tf.reset_default_graph()
+    # Graph-level seed must be set after the reset, or it's discarded with the old graph
+    if parameters.get('seed') is not None:
+        tf.set_random_seed(parameters['seed'])
 
     No = len(dataX)
     data_dim = len(dataX[0][0, :])
