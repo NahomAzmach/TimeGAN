@@ -48,6 +48,39 @@ def list_buildings(site=DEFAULT_SITE, year=DEFAULT_YEAR):
     local_file = download_site_csv(site, year)
     return list(pd.read_csv(local_file, index_col=0, nrows=0).columns)
 
+# Pooled options look like "group:office". Column names are "<Site>_<usage>_<Name>".
+GROUP_PREFIX = "group:"
+
+def building_usage(column):
+    return column.split("_")[1]
+
+def list_building_options(site=DEFAULT_SITE, year=DEFAULT_YEAR):
+    """Returns pooled usage groups (with 3+ buildings) followed by individual buildings."""
+    buildings = list_buildings(site, year)
+    usages = pd.Series([building_usage(b) for b in buildings]).value_counts()
+    groups = [f"{GROUP_PREFIX}{usage}" for usage, count in usages.items() if count >= 3]
+    return groups + buildings
+
+def is_group(building):
+    return building.startswith(GROUP_PREFIX)
+
+def describe_option(building, buildings=None):
+    """Human-readable label for a building option."""
+    if not is_group(building):
+        return building
+    usage = building[len(GROUP_PREFIX):]
+    count = sum(building_usage(b) == usage for b in buildings) if buildings else None
+    return f"All {usage} buildings" + (f" ({count}, pooled)" if count else " (pooled)")
+
+def _daily_sequences(loads, seq_len):
+    num_seq = len(loads) // seq_len
+    sequences = []
+    for i in range(num_seq):
+        seq = loads[i*seq_len : (i+1)*seq_len]
+        if not np.any(np.isnan(seq)):
+            sequences.append(seq)
+    return sequences
+
 def generate_mock_energy_data(scenario, seq_len, n_samples):
     """
     Fallback mathematical generation replicating real energy trends
@@ -73,27 +106,36 @@ def generate_mock_energy_data(scenario, seq_len, n_samples):
 
 def load_scenario_data(scenario="Baseline", seq_len=24, n_samples=100, building=DEFAULT_BUILDING, progress_callback=None):
     """
-    Loads one BDG-2 building's hourly load and filters daily sequences by Scenario.
+    Loads BDG-2 hourly load and filters daily sequences by Scenario.
     scenario: 'Baseline' or 'Load Surge'
+    building: a column name, or a pooled group like 'group:office'. Pooled buildings are
+              each divided by their own mean load so different-sized buildings are comparable,
+              which gives thousands of days instead of ~365.
     Returns (dataX, source): dataX is a list of numpy arrays, each of shape [seq_len, 1];
-    source describes where the data came from ('real' building name or 'mock fallback').
+    source describes where the data came from (building/group name or 'mock fallback').
     """
     try:
         if progress_callback: progress_callback("Loading BDG-2 site data...", 0)
         df = load_site_dataframe(progress_callback=progress_callback)
-        if building not in df.columns:
+
+        if is_group(building):
+            usage = building[len(GROUP_PREFIX):]
+            columns = [c for c in df.columns if building_usage(c) == usage]
+            if not columns:
+                raise KeyError(f"No '{usage}' buildings found in site data")
+        elif building in df.columns:
+            columns = [building]
+        else:
             raise KeyError(f"Building '{building}' not found in site data")
 
-        if progress_callback: progress_callback(f"Slicing {building} into daily sequences...", 60)
-        loads = df[building].values
-
-        # Chop into sequences of length seq_len
-        num_seq = len(loads) // seq_len
+        if progress_callback: progress_callback(f"Slicing {len(columns)} building(s) into daily sequences...", 60)
         sequences = []
-        for i in range(num_seq):
-            seq = loads[i*seq_len : (i+1)*seq_len]
-            if not np.any(np.isnan(seq)):
-                sequences.append(seq)
+        for column in columns:
+            loads = df[column].values
+            if is_group(building):
+                loads = loads / np.nanmean(loads)
+            # Chop into sequences of length seq_len
+            sequences.extend(_daily_sequences(loads, seq_len))
 
         # Calculate variation metrics to separate scenarios
         # Variation = Max - Min
@@ -102,7 +144,7 @@ def load_scenario_data(scenario="Baseline", seq_len=24, n_samples=100, building=
         # We sort sequences by their load variation
         sorted_pairs = sorted(zip(variations, sequences), key=lambda x: x[0])
 
-        # A single building-year only has ~365 days, so cap at half to keep the scenarios disjoint
+        # Cap at half the available days to keep the scenarios disjoint (~182 for one building-year)
         n_samples = min(n_samples, len(sorted_pairs) // 2)
 
         if scenario == "Baseline":
