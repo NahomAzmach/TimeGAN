@@ -8,6 +8,7 @@ import timegan_core
 import timegan_torch
 import data_processor
 import metrics
+import plots
 
 st.set_page_config(page_title="TimeGAN: Synthetic Data Generator", page_icon="📈", layout="wide")
 
@@ -135,33 +136,8 @@ if st.session_state.synthetic_data is not None and st.session_state.real_data is
     loss_history = st.session_state.get('loss_history')
     if loss_history:
         with st.expander("Training Loss Curves", expanded=True):
-            fig_loss, axes_loss = plt.subplots(1, 3, figsize=(15, 4))
-
-            def smooth(values, window=25):
-                values = np.asarray(values)
-                if len(values) < window:
-                    return values
-                return np.convolve(values, np.ones(window) / window, mode='valid')
-
-            axes_loss[0].plot(smooth(loss_history['embedding_recon']))
-            axes_loss[0].set_title("1. Embedding: reconstruction MSE")
-            axes_loss[1].plot(smooth(loss_history['supervised']))
-            axes_loss[1].set_title("2. Supervisor: supervised MSE")
-            for ax in axes_loss[:2]:
-                ax.set_yscale('log')
-                ax.set_xlabel("Iteration")
-
-            for key, label in [('joint_D', "Discriminator"), ('joint_G_adversarial', "Generator (adversarial)"),
-                               ('joint_G_moments', "Generator (moments)")]:
-                axes_loss[2].plot(smooth(loss_history[key]), label=label)
-            # D loss is a sum of 3 BCE terms; 3·ln2 is what it would be if D couldn't tell real from fake at all
-            axes_loss[2].axhline(3 * np.log(2), color='gray', linestyle=':', label="D at chance (3·ln2)")
-            axes_loss[2].set_title("3. Joint training")
-            axes_loss[2].set_xlabel("Iteration")
-            axes_loss[2].legend(fontsize=8)
-            st.pyplot(fig_loss)
-            st.caption("Curves are smoothed over 25 iterations. Phases 1–2 should drop and flatten before joint training starts. "
-                       "In phase 3, a discriminator loss far below the dotted line means it's winning and the generator isn't keeping up.")
+            st.pyplot(plots.loss_curves_figure(loss_history))
+            st.caption(plots.LOSS_CAPTION)
 
     st.markdown("---")
     st.subheader("Quantitative Evaluation")

@@ -17,8 +17,11 @@ def download_site_csv(site=DEFAULT_SITE, year=DEFAULT_YEAR, progress_callback=No
     Downloads one BDG-2 site CSV (~8 MB, one column per building, hourly) and caches it locally.
     Returns the local file path.
     """
+    return download_file(f"{site}_clean={year}.csv", progress_callback)
+
+def download_file(filename, progress_callback=None):
+    """Downloads one file from the BDG-2 folder of the bucket (cached). Returns the local path."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    filename = f"{site}_clean={year}.csv"
     local_file = os.path.join(DATA_DIR, filename)
 
     if not os.path.exists(local_file):
@@ -168,3 +171,79 @@ def load_scenario_data(scenario="Baseline", seq_len=24, n_samples=100, building=
         if progress_callback: progress_callback(f"Real data unavailable, generating mathematical '{scenario}' fallback...", 100)
         print(f"Real data load failed ({e}), using math fallback generator.")
         return generate_mock_energy_data(scenario, seq_len, n_samples), "mock fallback"
+
+
+# ---------------------------------------------------------------------------
+# Conditional generation: describe each day by a small feature vector instead
+# of slicing the data into a fixed set of scenarios.
+# ---------------------------------------------------------------------------
+
+# Features that can be measured from the load curve itself (used to check generated days too)
+SHAPE_FEATURES = ["mean_load", "peak_hour", "peak_ratio"]
+# Features that come from the calendar / weather, not the curve
+CONTEXT_FEATURES = ["weekend", "temperature"]
+CONDITION_FEATURES = SHAPE_FEATURES + CONTEXT_FEATURES
+
+FEATURE_LABELS = {
+    "mean_load": "Average load",
+    "peak_hour": "Peak hour",
+    "peak_ratio": "Peak ÷ average",
+    "weekend": "Weekend",
+    "temperature": "Avg temperature (°C)",
+}
+
+def shape_features(sequences):
+    """
+    sequences: array-like [N, Seq_Len] or [N, Seq_Len, 1].
+    Returns [N, 3]: daily mean, hour of the maximum, and max / mean (surge strength).
+    """
+    seqs = np.asarray(sequences, dtype=np.float64).reshape(len(sequences), -1)
+    mean = seqs.mean(axis=1)
+    peak_hour = seqs.argmax(axis=1).astype(np.float64)
+    peak_ratio = seqs.max(axis=1) / np.maximum(mean, 1e-6)
+    return np.stack([mean, peak_hour, peak_ratio], axis=1)
+
+def load_daily_temperature(site=DEFAULT_SITE, year=DEFAULT_YEAR):
+    """Returns a Series of daily mean temperature (°C) indexed by date."""
+    weather = pd.read_csv(download_file(f"weather_{site}.csv"), index_col=0, parse_dates=True)
+    weather = weather[weather.index.year == year]
+    return weather["temperature"].resample("D").mean()
+
+def load_conditional_data(building=f"{GROUP_PREFIX}office", seq_len=24, progress_callback=None):
+    """
+    Loads *every* day for a building or pooled group, with a condition vector per day.
+    Returns (dataX, conditions, dates):
+      dataX: [N, seq_len, 1] daily load curves (pooled groups scaled by each building's mean)
+      conditions: [N, len(CONDITION_FEATURES)] raw feature values, columns in CONDITION_FEATURES order
+      dates: list of (column, date) for each day, to look up the real days behind a condition
+    """
+    if progress_callback: progress_callback("Loading BDG-2 site data...", 0)
+    df = load_site_dataframe(progress_callback=progress_callback)
+    columns = [c for c in df.columns if building_usage(c) == building[len(GROUP_PREFIX):]] if is_group(building) else [building]
+
+    if progress_callback: progress_callback("Loading weather data...", 50)
+    temperature = load_daily_temperature()
+
+    if progress_callback: progress_callback(f"Building condition vectors for {len(columns)} building(s)...", 70)
+    dataX, contexts, dates = [], [], []
+    days = df.index[::seq_len][: len(df) // seq_len]
+    for column in columns:
+        loads = df[column].values
+        if is_group(building):
+            loads = loads / np.nanmean(loads)
+        for i, day in enumerate(days):
+            seq = loads[i*seq_len : (i+1)*seq_len]
+            # Skip gaps and dead days (mean ~0 makes peak ratio meaningless)
+            if np.any(np.isnan(seq)) or seq.mean() <= 1e-3:
+                continue
+            temp = temperature.get(day.normalize(), np.nan)
+            if np.isnan(temp):
+                continue
+            dataX.append(seq.reshape(-1, 1))
+            contexts.append([float(day.dayofweek >= 5), temp])
+            dates.append((column, day.date()))
+
+    dataX = np.array(dataX)
+    conditions = np.concatenate([shape_features(dataX), np.array(contexts)], axis=1)
+    if progress_callback: progress_callback(f"Loaded {len(dataX)} days.", 100)
+    return dataX, conditions, dates

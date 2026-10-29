@@ -187,3 +187,34 @@ def embed_2d(real, synthetic, method="pca", max_points=500):
     perplexity = min(40, len(combined) - 1)
     emb = TSNE(n_components=2, perplexity=perplexity, init="pca", random_state=0).fit_transform(combined)
     return emb[:len(real_n)], emb[len(real_n):]
+
+def condition_adherence(generate_fn, conditions, feature_names, shape_features_fn):
+    """
+    Does a conditional generator actually follow its condition?
+    generate_fn: conditions [N, k] -> sequences [N, Seq_Len, 1]
+    conditions: [N, k] raw condition vectors (ideally from held-out real days)
+    feature_names: names of the k condition columns; the first m are measurable from a curve
+    shape_features_fn: sequences -> [N, m] measured features (same order as the first m columns)
+
+    For each measurable feature returns the mean absolute error between requested and measured,
+    for (a) the real conditions and (b) the same conditions shuffled across days. If (a) isn't
+    clearly below (b), the generator is ignoring that part of the condition.
+    """
+    conditions = np.asarray(conditions)
+    measured = shape_features_fn(generate_fn(conditions))
+    shuffled = conditions[np.random.permutation(len(conditions))]
+    measured_shuffled = shape_features_fn(generate_fn(shuffled))
+
+    results = {}
+    for j in range(measured.shape[1]):
+        requested = conditions[:, j]
+        results[feature_names[j]] = {
+            'conditioned_mae': float(np.mean(np.abs(measured[:, j] - requested))),
+            'shuffled_mae': float(np.mean(np.abs(measured_shuffled[:, j] - requested))),
+        }
+    # Peak hour is the one users will check by eye, so also report "within 1 hour"
+    if 'peak_hour' in feature_names:
+        j = feature_names.index('peak_hour')
+        results['peak_hour']['within_1h'] = float(np.mean(np.abs(measured[:, j] - conditions[:, j]) <= 1))
+        results['peak_hour']['within_1h_shuffled'] = float(np.mean(np.abs(measured_shuffled[:, j] - conditions[:, j]) <= 1))
+    return results
